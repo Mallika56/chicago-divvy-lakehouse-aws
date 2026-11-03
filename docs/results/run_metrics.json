@@ -1,0 +1,11 @@
+{
+  "rows_read": 24019,
+  "rows_curated": 23384,
+  "rows_quarantined": 635,
+  "quarantined_by_reason": {
+    "too_short_under_1_min": 614,
+    "too_long_over_24h": 19,
+    "missing_end_location": 1,
+    "outside_service_area": 1
+  }
+}

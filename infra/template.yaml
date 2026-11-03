@@ -1,0 +1,301 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Chicago Divvy lakehouse - S3 raw/curated zones, Glue catalog + crawler + PySpark
+  ETL job, Athena workgroup with a cost guardrail, and failure alerts.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: divvy-lakehouse
+    AllowedPattern: "[a-z0-9-]+"
+    Description: Prefix for every resource name (lowercase, digits, hyphens).
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional email for Glue job failure alerts (confirm the SNS email after deploy).
+  EnableMonthlySchedule:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Run the ETL automatically on the 5th of each month (after Divvy publishes).
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  ScheduleOn: !Equals [!Ref EnableMonthlySchedule, "true"]
+
+Resources:
+  # ---------------------------------------------------------------- storage
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-raw-${AWS::AccountId}"
+      VersioningConfiguration: { Status: Enabled }     # raw is the source of truth: never lose it
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: raw-to-glacier-ir-after-90-days      # raw CSV is rarely re-read: store it cheaply
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 90
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+
+  CuratedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-curated-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-athena-results-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-query-results-after-7-days
+            Status: Enabled
+            ExpirationInDays: 7
+
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-artifacts-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ---------------------------------------------------------------- catalog
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: divvy_lake
+        Description: Divvy bike-share trips (raw + curated)
+
+  # Curated table defined explicitly (not crawled) so its schema is code-reviewed.
+  # Partition projection: Athena computes partition paths itself, no crawler/MSCK needed.
+  CuratedTripsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: divvy_trips
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          projection.enabled: "true"
+          projection.year.type: integer
+          projection.year.range: "2020,2030"
+          projection.month.type: integer
+          projection.month.range: "1,12"
+          storage.location.template: !Sub "s3://${CuratedBucket}/divvy_trips/year=${!year}/month=${!month}/"
+        PartitionKeys:
+          - { Name: year, Type: int }
+          - { Name: month, Type: int }
+        StorageDescriptor:
+          Location: !Sub "s3://${CuratedBucket}/divvy_trips/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - { Name: ride_id, Type: string }
+            - { Name: rideable_type, Type: string }
+            - { Name: member_casual, Type: string }
+            - { Name: started_at, Type: timestamp }
+            - { Name: ended_at, Type: timestamp }
+            - { Name: ride_date, Type: date }
+            - { Name: start_hour, Type: int }
+            - { Name: start_dow, Type: int }
+            - { Name: is_weekend, Type: boolean }
+            - { Name: duration_min, Type: double }
+            - { Name: distance_km, Type: double }
+            - { Name: is_round_trip, Type: boolean }
+            - { Name: start_station_id, Type: string }
+            - { Name: start_station_name, Type: string }
+            - { Name: end_station_id, Type: string }
+            - { Name: end_station_name, Type: string }
+            - { Name: has_start_station, Type: boolean }
+            - { Name: has_end_station, Type: boolean }
+            - { Name: start_lat, Type: double }
+            - { Name: start_lng, Type: double }
+            - { Name: end_lat, Type: double }
+            - { Name: end_lng, Type: double }
+            - { Name: source_file, Type: string }
+
+  # The crawler catalogs the RAW zone (schema discovery for CSV that arrives as-is).
+  RawCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "${ProjectName}-raw-crawler"
+      Role: !GetAtt GlueRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      TablePrefix: raw_
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${RawBucket}/divvy_trips/"
+      SchemaChangePolicy:
+        UpdateBehavior: LOG                 # alert-worthy: don't silently rewrite the schema
+        DeleteBehavior: LOG
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_NEW_FOLDERS_ONLY
+
+  # ---------------------------------------------------------------- compute
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-glue-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: glue.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: lake-access-least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadRawAndArtifacts
+                Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt RawBucket.Arn
+                  - !Sub "${RawBucket.Arn}/*"
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub "${ArtifactsBucket.Arn}/*"
+              - Sid: WriteCurated
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt CuratedBucket.Arn
+                  - !Sub "${CuratedBucket.Arn}/*"
+
+  RawToCuratedJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub "${ProjectName}-raw-to-curated"
+      Role: !GetAtt GlueRole.Arn
+      GlueVersion: "5.0"                     # Spark 3.5, Python 3.11
+      WorkerType: G.1X
+      NumberOfWorkers: 2                     # smallest useful cluster; ~1 month of Divvy fits easily
+      Timeout: 30                            # minutes: a runaway job can't burn money all night
+      MaxRetries: 0
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${ArtifactsBucket}/glue/raw_to_curated.py"
+      DefaultArguments:
+        "--extra-py-files": !Sub "s3://${ArtifactsBucket}/glue/divvy_lakehouse.zip"
+        "--RAW_PATH": !Sub "s3://${RawBucket}/divvy_trips/*/*/*.csv"
+        "--CURATED_PATH": !Sub "s3://${CuratedBucket}/divvy_trips/"
+        "--QUARANTINE_PATH": !Sub "s3://${CuratedBucket}/divvy_trips_quarantine/"
+        "--METRICS_PATH": !Sub "s3://${CuratedBucket}/_run_metrics/"
+        "--job-bookmark-option": job-bookmark-disable
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+
+  MonthlyTrigger:
+    Type: AWS::Glue::Trigger
+    Condition: ScheduleOn
+    Properties:
+      Name: !Sub "${ProjectName}-monthly"
+      Type: SCHEDULED
+      Schedule: cron(0 12 5 * ? *)          # 12:00 UTC on the 5th of every month
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref RawToCuratedJob
+
+  # ---------------------------------------------------------------- query
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${ProjectName}-wg"
+      State: ENABLED
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 1073741824   # 1 GB cap per query = max ~$0.005 per query
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AthenaResultsBucket}/results/"
+          EncryptionConfiguration: { EncryptionOption: SSE_S3 }
+
+  # ---------------------------------------------------------------- alerting
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-alerts"
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  GlueJobFailedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-glue-job-failed"
+      EventPattern:
+        source: [aws.glue]
+        detail-type: [Glue Job State Change]
+        detail:
+          jobName: [!Ref RawToCuratedJob]
+          state: [FAILED, TIMEOUT, ERROR]
+      Targets:
+        - Arn: !Ref AlertTopic
+          Id: sns-alert
+
+Outputs:
+  RawBucketName: { Value: !Ref RawBucket }
+  CuratedBucketName: { Value: !Ref CuratedBucket }
+  ArtifactsBucketName: { Value: !Ref ArtifactsBucket }
+  GlueJobName: { Value: !Ref RawToCuratedJob }
+  CrawlerName: { Value: !Ref RawCrawler }
+  AthenaWorkGroupName: { Value: !Ref AthenaWorkGroup }

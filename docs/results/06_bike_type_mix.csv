@@ -1,0 +1,5 @@
+rideable_type,member_casual,rides,median_minutes,avg_km,pct_dockless_start
+classic_bike,casual,2072,14.9,2.13,0.0
+classic_bike,member,4702,9.4,2.0,0.0
+electric_bike,casual,6166,10.2,2.23,28.0
+electric_bike,member,10444,8.5,2.42,29.1
