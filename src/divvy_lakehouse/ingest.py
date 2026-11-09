@@ -46,12 +46,14 @@ def month_range(spec: str) -> list[str]:
 
 
 def check_header(first_line: str, name: str) -> None:
+    """Raise ValueError if a CSV's header doesn't match the expected raw columns."""
     header = next(csv.reader([first_line]))
     if header != RAW_COLUMNS:
         raise ValueError(f"{name}: unexpected header {header}. Divvy may have changed the schema.")
 
 
 def raw_key(yyyymm: str) -> str:
+    """Build the Hive-style raw-zone key for a 'YYYYMM' month, e.g. '202607' -> 'divvy_trips/ingest_year=2026/ingest_month=07/202607-divvy-tripdata.csv'."""
     return f"divvy_trips/ingest_year={yyyymm[:4]}/ingest_month={yyyymm[4:]}/{yyyymm}-divvy-tripdata.csv"
 
 
@@ -107,6 +109,7 @@ def ingest_from_dir(src_dir: str, dest: str) -> list[str]:
 
 
 def main() -> None:
+    """CLI entry point: land Divvy monthly files (downloaded or from a local dir) in the raw zone."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--months", help="YYYY-MM or YYYY-MM:YYYY-MM to download from Divvy")
