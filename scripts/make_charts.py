@@ -24,7 +24,8 @@ plt.rcParams.update({
 })
 
 
-def hourly():
+def hourly() -> None:
+    """Plot weekday vs. weekend ride-share-by-hour for members and casual riders."""
     df = pd.read_csv(RES / "03_hourly_profile.csv")
     fig, axes = plt.subplots(1, 2, figsize=(10, 3.6), sharey=True)
     for ax, day in zip(axes, ["weekday", "weekend"]):
@@ -46,7 +47,8 @@ def hourly():
     fig.savefig(IMG / "hourly_profile.png", dpi=160)
 
 
-def monthly():
+def monthly() -> None:
+    """Plot monthly ride counts by rider type across the sampled year."""
     df = pd.read_csv(RES / "04_monthly_trend.csv")
     fig, ax = plt.subplots(figsize=(10, 3.6))
     x = range(12)
@@ -64,7 +66,8 @@ def monthly():
     fig.savefig(IMG / "monthly_trend.png", dpi=160)
 
 
-def stations():
+def stations() -> None:
+    """Plot the top 10 stations for casual-rider starts."""
     df = pd.read_csv(RES / "05_top_casual_stations.csv").iloc[::-1]
     fig, ax = plt.subplots(figsize=(10, 3.8))
     ax.barh(df.start_station_name, df.casual_rides, color=COLOR["casual"], height=0.6)
