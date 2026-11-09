@@ -24,10 +24,12 @@ RESULTS = ROOT / "docs/results"
 
 
 def to_duckdb(sql: str) -> str:
+    """Rewrite Athena-only SQL functions to their DuckDB equivalents."""
     return re.sub(r"\bapprox_percentile\s*\(", "quantile_cont(", sql, flags=re.IGNORECASE)
 
 
 def connect() -> duckdb.DuckDBPyConnection:
+    """Open a DuckDB connection with a divvy_lake.divvy_trips view over the curated Parquet."""
     con = duckdb.connect()
     con.execute("CREATE SCHEMA divvy_lake")
     con.execute(
@@ -38,6 +40,7 @@ def connect() -> duckdb.DuckDBPyConnection:
 
 
 def run_all() -> dict[str, "object"]:
+    """Run every non-Athena-only query in sql/athena/, saving and returning each result."""
     RESULTS.mkdir(parents=True, exist_ok=True)
     con = connect()
     out = {}
