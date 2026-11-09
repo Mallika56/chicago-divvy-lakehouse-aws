@@ -29,6 +29,7 @@ LAKE = ROOT / "lake"
 
 
 def main() -> None:
+    """Run ingest, transform, and query stages locally against the committed sample data."""
     if LAKE.exists():
         shutil.rmtree(LAKE)
 
