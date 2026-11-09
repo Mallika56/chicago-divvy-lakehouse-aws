@@ -185,6 +185,7 @@ CURATED_COLUMNS = [
 
 
 def split_valid_invalid(df: DataFrame) -> tuple[DataFrame, DataFrame]:
+    """Split a dq_reason-tagged DataFrame into (curated valid rows, quarantined invalid rows)."""
     valid = df.filter(F.col("dq_reason").isNull()).select(*CURATED_COLUMNS)
     invalid = df.filter(F.col("dq_reason").isNotNull()).select(
         "ride_id", "dq_reason", "rideable_type", "member_casual", "started_at",
